@@ -42,6 +42,78 @@ func newResponsesChatTestContext(t *testing.T, body string, isStream bool) (*gin
 	return c, recorder, resp, info
 }
 
+func TestResponsesToChatErrorEventDoesNotFinishSuccessfully(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, tc := range []struct {
+		name   string
+		event  string
+		output bool
+	}{
+		{"flat_before_output", `{"type":"error","code":"server_error","message":"synthetic upstream failure"}`, false},
+		{"nested_after_output", `{"type":"error","error":{"type":"upstream_error","code":"20001","message":"synthetic upstream failure"}}`, true},
+	} {
+		for _, format := range []types.RelayFormat{types.RelayFormatOpenAI, types.RelayFormatClaude} {
+			t.Run(tc.name+"/"+string(format), func(t *testing.T) {
+				body := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\",\"model\":\"gpt-test\"}}\n\n"
+				if tc.output {
+					body += "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"
+				}
+				body += "data: " + tc.event + "\n\n"
+				c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+				info.RelayFormat = format
+				info.SetEstimatePromptTokens(10)
+
+				usage, apiErr := OaiResponsesToChatStreamHandler(c, info, resp)
+				if tc.output {
+					require.Nil(t, apiErr)
+					require.NotNil(t, usage)
+					assert.Equal(t, 10, usage.PromptTokens)
+					assert.Positive(t, usage.CompletionTokens)
+					assert.Contains(t, recorder.Body.String(), "hello")
+					assert.Contains(t, recorder.Body.String(), `"error":`)
+				} else {
+					require.NotNil(t, apiErr)
+					assert.Nil(t, usage)
+				}
+				require.NotNil(t, info.StreamStatus)
+				assert.True(t, info.StreamStatus.ResponseFailed())
+				assert.NotContains(t, recorder.Body.String(), "data: [DONE]")
+				assert.NotContains(t, recorder.Body.String(), `"finish_reason":"stop"`)
+				assert.NotContains(t, recorder.Body.String(), "event: message_stop")
+			})
+		}
+	}
+}
+
+func TestResponsesToChatBufferedErrorEventReturnsFailure(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+
+	for _, event := range []string{
+		`{"type":"error","code":"server_error","message":"synthetic upstream failure"}`,
+		`{"type":"error","error":{"type":"upstream_error","code":"20001","message":"synthetic upstream failure"}}`,
+	} {
+		t.Run(event, func(t *testing.T) {
+			body := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" + "data: " + event + "\n\n"
+			c, recorder, resp, info := newResponsesChatTestContext(t, body, false)
+			info.SetEstimatePromptTokens(10)
+
+			usage, apiErr := OaiResponsesToChatBufferedStreamHandler(c, info, resp)
+			require.NotNil(t, apiErr)
+			assert.Nil(t, usage)
+			assert.Empty(t, recorder.Body.String())
+			assert.True(t, info.StreamStatus.ResponseFailed())
+		})
+	}
+}
+
 func TestOaiResponsesToChatStreamHandlerConvertsSSEOrderAndUsage(t *testing.T) {
 	oldMode := gin.Mode()
 	gin.SetMode(gin.TestMode)
@@ -142,6 +214,53 @@ func TestOaiResponsesToChatStreamHandlerConvertsClaudeSSETerminalsAndUsage(t *te
 		"event: message_delta\n",
 		"event: message_stop\n",
 	)
+}
+
+func TestOaiResponsesToChatStreamHandlerIgnoresHeartbeatBeforeClaudeTools(t *testing.T) {
+	oldMode := gin.Mode()
+	gin.SetMode(gin.TestMode)
+	t.Cleanup(func() { gin.SetMode(oldMode) })
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	body := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","item_id":"SSE-Keep-Alive","output_index":0,"content_index":0,"delta":"","SSE-Keep-Alive":true}`,
+		`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test"}}`,
+		`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}`,
+		`data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","delta":"plan"}`,
+		`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"plan"}]}}`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup"}}`,
+		`data: {"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{\"q\":\"x\"}"}`,
+		`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"x\"}"}}`,
+		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	c, recorder, resp, info := newResponsesChatTestContext(t, body, true)
+	info.RelayFormat = types.RelayFormatClaude
+
+	usage, apiErr := OaiResponsesToChatStreamHandler(c, info, resp)
+	require.Nil(t, apiErr)
+	require.NotNil(t, usage)
+	assert.Equal(t, 5, usage.TotalTokens)
+	got := recorder.Body.String()
+	assert.NotContains(t, got, "SSE-Keep-Alive")
+	assert.Equal(t, 1, strings.Count(got, "event: message_start\n"))
+	assert.Equal(t, 2, strings.Count(got, "event: content_block_start\n"))
+	assert.Equal(t, 2, strings.Count(got, "event: content_block_stop\n"))
+	assert.Equal(t, 1, strings.Count(got, "event: message_stop\n"))
+	assert.Contains(t, got, `"id":"resp_1"`)
+	assert.Contains(t, got, `"thinking":"plan"`)
+	assert.Contains(t, got, `"id":"call_1"`)
+	assert.Contains(t, got, `"name":"lookup"`)
+	assert.Contains(t, got, `"partial_json":"{\"q\":\"x\"}"`)
+	assert.Contains(t, got, `"stop_reason":"tool_use"`)
+	assert.Contains(t, got, `"input_tokens":2`)
+	assert.Contains(t, got, `"output_tokens":3`)
+	requireOrderedSubstrings(t, got,
+		"event: message_start\n", `"thinking":"plan"`, `"name":"lookup"`,
+		"event: message_delta\n", "event: message_stop\n")
 }
 
 func TestOaiResponsesToChatBufferedStreamHandlerReturnsJSONFromSSE(t *testing.T) {
