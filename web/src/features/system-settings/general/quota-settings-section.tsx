@@ -55,6 +55,7 @@ const quotaSchema = z.object({
   QuotaForNewUser: z.coerce.number().min(0),
   QuotaForInviter: z.coerce.number().min(0),
   QuotaForInvitee: z.coerce.number().min(0),
+  AffiliateCommissionRate: z.coerce.number().min(0).max(100),
   TopUpLink: z.string(),
   quota_setting: z.object({
     enable_free_model_pre_consume: z.boolean(),
@@ -273,6 +274,35 @@ export function QuotaSettingsSection({
                     {t('Quota given to invited users ({{formattedQuota}})', {
                       formattedQuota: formatQuotaInputValue(field.value),
                     })}
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name='AffiliateCommissionRate'
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('Default Commission Rate')}</FormLabel>
+                  <FormControl>
+                    <Input
+                      type='number'
+                      min={0}
+                      max={100}
+                      step={0.01}
+                      value={field.value ?? ''}
+                      onChange={handleNumberChange(field.onChange)}
+                      name={field.name}
+                      onBlur={field.onBlur}
+                      ref={field.ref}
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    {t(
+                      'Default percentage rewarded to inviters after successful online payments.'
+                    )}
                   </FormDescription>
                   <FormMessage />
                 </FormItem>

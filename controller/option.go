@@ -197,7 +197,7 @@ func UpdateOption(c *gin.Context) {
 		option.Value = fmt.Sprintf("%v", option.Value)
 	}
 	switch option.Key {
-	case "QuotaForInviter", "QuotaForInvitee":
+	case "QuotaForInviter", "QuotaForInvitee", "AffiliateCommissionRate":
 		if isPositiveOptionValue(option.Value.(string)) && !operation_setting.IsPaymentComplianceConfirmed() {
 			common.ApiErrorT(c, "Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
 			return
@@ -267,6 +267,16 @@ func UpdateOption(c *gin.Context) {
 	case "GroupRatio":
 		err = ratio_setting.CheckGroupRatio(option.Value.(string))
 		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+	case "AffiliateCommissionRate":
+		rate, parseErr := strconv.ParseFloat(option.Value.(string), 64)
+		if parseErr != nil {
+			common.ApiErrorT(c, "Commission rate must be between 0 and 100.")
+			return
+		}
+		if err := model.ValidateAffiliateCommissionRate(rate); err != nil {
 			common.ApiError(c, err)
 			return
 		}

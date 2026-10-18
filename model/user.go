@@ -10,7 +10,6 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
@@ -103,6 +102,7 @@ type User struct {
 	AffQuota             int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
 	AffHistoryQuota      int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
 	InviterId            int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+	AffCommissionRate    *float64                   `json:"aff_commission_rate" gorm:"column:aff_commission_rate"`
 	DeletedAt            gorm.DeletedAt             `gorm:"index"`
 	LinuxDOId            string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
 	Setting              string                     `json:"setting" gorm:"type:text;column:setting"`
@@ -541,12 +541,11 @@ func GetSelfUserById(id int) (*User, error) {
 }
 
 func GetUserIdByAffCode(affCode string) (int, error) {
+	affCode = strings.TrimSpace(affCode)
 	if affCode == "" {
 		return 0, errors.New("affiliate code is empty")
 	}
-	var user User
-	err := DB.Select("id").First(&user, "aff_code = ?", affCode).Error
-	return user.Id, err
+	return findUserIdByAffiliateCode(DB, affCode)
 }
 
 // DeleteUserById soft-deletes a user and returns how many scoped access tokens
@@ -567,21 +566,6 @@ func HardDeleteUserById(id int) (int64, error) {
 	}
 	user := User{Id: id}
 	return user.HardDelete()
-}
-
-func inviteUser(inviterId int) error {
-	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]any{
-		"aff_count":   gorm.Expr("aff_count + ?", 1),
-		"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
-		"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
-	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
 }
 
 func (user *User) TransferAffQuotaToQuota(quota int) error {
@@ -618,7 +602,11 @@ func (user *User) TransferAffQuotaToQuota(quota int) error {
 	}
 
 	// 提交事务
-	return tx.Commit().Error
+	if err := tx.Commit().Error; err != nil {
+		return err
+	}
+	syncCreditUserQuotaCache(user.Id, quota, common.LogText("affiliate transfer"))
+	return nil
 }
 
 func (user *User) prepareForInsert(tx *gorm.DB) error {
@@ -680,6 +668,9 @@ func (user *User) Insert(inviterId int) error {
 			}
 			user.Quota = common.QuotaForNewUser
 			user.AffCode = common.GetRandomString(4)
+			if inviterId > 0 {
+				user.InviterId = inviterId
+			}
 
 			// 初始化用户设置，包括默认的边栏配置
 			if user.Setting == "" {
@@ -717,17 +708,7 @@ func (user *User) finishInsert(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, common.NewMessage("Invitation code bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInvitee)}))
-		}
-		if common.QuotaForInviter > 0 {
-			//_ = IncreaseUserQuota(inviterId, common.QuotaForInviter)
-			RecordLog(inviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInviter)}))
-			_ = inviteUser(inviterId)
-		}
-	}
+	finishAffiliateInvite(user.Id, inviterId)
 }
 
 func (user *User) FinishInsert(inviterId int) {
@@ -744,6 +725,11 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 		}
 		user.Quota = common.QuotaForNewUser
 		user.AffCode = common.GetRandomString(4)
+		// OAuth registration previously only rewarded the inviter and never
+		// persisted inviter_id, so later top-up/subscription snapshots saw 0.
+		if inviterId > 0 {
+			user.InviterId = inviterId
+		}
 
 		// 初始化用户设置
 		if user.Setting == "" {
@@ -774,16 +760,7 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, common.NewMessage("Invitation code bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInvitee)}))
-		}
-		if common.QuotaForInviter > 0 {
-			RecordLog(inviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInviter)}))
-			_ = inviteUser(inviterId)
-		}
-	}
+	finishAffiliateInvite(user.Id, inviterId)
 }
 
 func (user *User) Update(updatePassword bool) error {
@@ -980,6 +957,9 @@ func (user *User) delete(identity *AuthSessionIdentity) (int64, error) {
 		if err != nil {
 			return err
 		}
+		if err := removeAffiliateRelationBeforeDeleteTx(tx, user.Id); err != nil {
+			return err
+		}
 		return tx.Delete(user).Error
 	}); err != nil {
 		return 0, err
@@ -1016,6 +996,9 @@ func (user *User) HardDelete() (int64, error) {
 			}
 		}
 		if err := deleteUserAuthenticationData(tx, user.Id); err != nil {
+			return err
+		}
+		if err := removeAffiliateRelationBeforeDeleteTx(tx, user.Id); err != nil {
 			return err
 		}
 		return tx.Unscoped().Delete(user).Error

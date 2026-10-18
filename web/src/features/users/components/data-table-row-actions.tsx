@@ -28,6 +28,7 @@ import {
   ShieldAlert,
   Link2,
   CreditCard,
+  HandCoins,
 } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -60,6 +61,7 @@ import {
 } from '../constants'
 import { getUserActionMessage } from '../lib'
 import type { User } from '../types'
+import { AffiliateSettingsDialog } from './dialogs/affiliate-settings-dialog'
 import { UserBindingDialog } from './dialogs/user-binding-dialog'
 import { useUsers } from './users-provider'
 
@@ -88,6 +90,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
   const [resetTwoFAOpen, setResetTwoFAOpen] = useState(false)
   const [bindingDialogOpen, setBindingDialogOpen] = useState(false)
   const [subscriptionsDialogOpen, setSubscriptionsDialogOpen] = useState(false)
+  const [affiliateDialogOpen, setAffiliateDialogOpen] = useState(false)
 
   const handleEdit = () => {
     setCurrentRow(user)
@@ -251,24 +254,23 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
           </DropdownMenuItem>
         )}
 
-        <DropdownMenuItem
-          onSelect={(event) => {
-            event.preventDefault()
-            setBindingDialogOpen(true)
-          }}
-        >
+        <DropdownMenuItem onClick={() => setBindingDialogOpen(true)}>
           {t('Manage Bindings')}
           <DropdownMenuShortcut>
             <Link2 size={16} />
           </DropdownMenuShortcut>
         </DropdownMenuItem>
 
-        <DropdownMenuItem
-          onSelect={(event) => {
-            event.preventDefault()
-            setSubscriptionsDialogOpen(true)
-          }}
-        >
+        {!isRoot && (
+          <DropdownMenuItem onClick={() => setAffiliateDialogOpen(true)}>
+            {t('Invitation Settings')}
+            <DropdownMenuShortcut>
+              <HandCoins size={16} />
+            </DropdownMenuShortcut>
+          </DropdownMenuItem>
+        )}
+
+        <DropdownMenuItem onClick={() => setSubscriptionsDialogOpen(true)}>
           {t('Manage Subscriptions')}
           <DropdownMenuShortcut>
             <CreditCard size={16} />
@@ -278,10 +280,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         <DropdownMenuSeparator />
 
         <DropdownMenuItem
-          onSelect={(event) => {
-            event.preventDefault()
-            setResetPasskeyOpen(true)
-          }}
+          onClick={() => setResetPasskeyOpen(true)}
           disabled={isRoot}
         >
           {t('Reset Passkey')}
@@ -291,10 +290,7 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         </DropdownMenuItem>
 
         <DropdownMenuItem
-          onSelect={(event) => {
-            event.preventDefault()
-            setResetTwoFAOpen(true)
-          }}
+          onClick={() => setResetTwoFAOpen(true)}
           disabled={isRoot}
         >
           {t('Reset 2FA')}
@@ -352,6 +348,13 @@ export function DataTableRowActions({ row }: DataTableRowActionsProps) {
         open={subscriptionsDialogOpen}
         onOpenChange={setSubscriptionsDialogOpen}
         user={{ id: user.id, username: user.username }}
+        onSuccess={triggerRefresh}
+      />
+
+      <AffiliateSettingsDialog
+        open={affiliateDialogOpen}
+        onOpenChange={setAffiliateDialogOpen}
+        user={user}
         onSuccess={triggerRefresh}
       />
     </div>
