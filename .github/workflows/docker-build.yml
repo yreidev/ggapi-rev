@@ -1,91 +1,191 @@
-name: Publish Docker image (Multi-arch)
+name: Publish Docker image (Linux amd64)
+
+# Release tag → GHCR image ghcr.io/<owner>/<repo>, plus a GitHub Release with notes.
+# Never pushes to the upstream Docker Hub image. Bare binaries are optional via
+# release.yml dispatch only.
+#
+# Tag rules (see the release section in AGENTS.md):
+# - Form: <existing-upstream-tag>.N  e.g. v1.0.0-rc.45.1
+# - Tag commit must be an ancestor of origin/main
+# - GHCR tags: :<version> always; :latest only on tag-push when tip still matches after build+sign
+# - workflow_dispatch rebuild: version tag only, never :latest
+# - Single platform (linux/amd64); no redundant :*-amd64 release tags
 
 on:
   push:
     tags:
-      - '*'
-      - '!nightly*'
+      - 'v*'
+      - '!*-alpha*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name to build (e.g., v0.10.8-alpha.3)'
+        description: 'Tag name to rebuild (e.g., v1.0.0-rc.45.1). Must exist on main history. Does not move :latest.'
         required: true
         type: string
 
+# Serialize GHCR metadata and optional binary Release writes across workflows.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  build_single_arch:
-    name: Build & push (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  build_amd64:
+    name: Build & push (amd64)
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      image: ${{ steps.version.outputs.image }}
 
     permissions:
       packages: write
-      contents: read
+      contents: write
       id-token: write
 
     steps:
       - name: Check out
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          fetch-depth: ${{ github.event_name == 'workflow_dispatch' && 0 || 1 }}
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+          # Always fully-qualified tag ref so branch/tag name collisions cannot publish branch trees
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
 
-      - name: Resolve tag & write VERSION
+      - name: Resolve tag, validate, image name & write VERSION
         id: version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          GITHUB_REF: ${{ github.ref }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-            if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
-              echo "::error::Tag '$TAG' does not exist"
-              exit 1
-            fi
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+            EVENT=dispatch
           else
-            TAG=${GITHUB_REF#refs/tags/}
+            case "$GITHUB_REF" in
+              refs/tags/*) TAG=${GITHUB_REF#refs/tags/} ;;
+              *) echo "::error::Expected tag ref on push"; exit 1 ;;
+            esac
+            EVENT=push
           fi
-          echo "TAG=${TAG}" >> $GITHUB_ENV
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "${TAG}" > VERSION
-          echo "Building tag: ${TAG} for ${{ matrix.arch }}"
+
+          case "$TAG" in
+            *-alpha*|*-alpha.*)
+              echo "::error::Alpha tags are excluded from GHCR publish"
+              exit 1
+              ;;
+          esac
+
+          # Fork form: <BASE>.N where N >= 1 and BASE is an existing upstream-style tag
+          if ! printf '%s' "$TAG" | grep -Eq '\.[1-9][0-9]*$'; then
+            echo "::error::Tag must end with fork counter .N (N >= 1)"
+            exit 1
+          fi
+          BASE="${TAG%.*}"
+          N="${TAG##*.}"
+          if ! printf '%s' "$N" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::Invalid fork counter N"
+            exit 1
+          fi
+          if ! printf '%s' "$BASE" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Base is not a valid upstream version string"
+            exit 1
+          fi
+
+          git fetch origin --tags --force 2>/dev/null || true
+          if ! git rev-parse "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Release tag does not exist"
+            exit 1
+          fi
+
+          # BASE must be a genuine upstream tag (not a recursive fork tag like v1.0.0-rc.45.1.1)
+          git fetch --no-tags https://github.com/QuantumNous/new-api.git \
+            "refs/tags/${BASE}:refs/tags/upstream-base/${BASE}" || {
+            echo "::error::Base tag is not on QuantumNous/new-api; use <existing-upstream-tag>.N"
+            exit 1
+          }
+
+          # Prefer annotated tag peels; bind build tree to validated tag object
+          TAG_SHA=$(git rev-parse "refs/tags/${TAG}^{}")
+          BASE_SHA=$(git rev-parse "refs/tags/upstream-base/${BASE}^{}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [ "$HEAD_SHA" != "$TAG_SHA" ]; then
+            echo "::error::Checked-out HEAD does not match tag object (branch/tag collision or moved tag)"
+            exit 1
+          fi
+          git fetch origin main
+          MAIN_SHA=$(git rev-parse origin/main)
+
+          # BASE (upstream baseline) must actually be contained in this release commit
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$TAG_SHA"; then
+            echo "::error::Base tag is not an ancestor of the release tag commit"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$TAG_SHA" "$MAIN_SHA"; then
+            echo "::error::Release tag commit is not an ancestor of origin/main"
+            exit 1
+          fi
+
+          LATEST_CANDIDATE=false
+          if [ "$EVENT" = "push" ] && [ "$TAG_SHA" = "$MAIN_SHA" ]; then
+            LATEST_CANDIDATE=true
+          elif [ "$EVENT" = "push" ]; then
+            echo "::warning::origin/main is ahead of tag; will publish version tags only (no :latest)"
+          else
+            echo "Manual rebuild; will not move :latest"
+          fi
+
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          case "$IMAGE" in
+            *calciumion/new-api*|docker.io/calciumion/*)
+              echo "::error::Refusing upstream Docker Hub image namespace"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "TAG=${TAG}"
+            echo "BASE=${BASE}"
+            echo "IMAGE=${IMAGE}"
+            echo "TAG_SHA=${TAG_SHA}"
+            echo "LATEST_CANDIDATE=${LATEST_CANDIDATE}"
+          } >> "$GITHUB_ENV"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$TAG" > VERSION
+          echo "Building ${IMAGE}:${TAG} (amd64) latest_candidate=${LATEST_CANDIDATE}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (labels)
+      - name: Extract metadata (version tag only)
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: calciumion/new-api
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ env.TAG }}
 
-      - name: Build & push
+      - name: Build & push version tag
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           push: true
-          tags: |
-            calciumion/new-api:${{ env.TAG }}-${{ matrix.arch }}
-            calciumion/new-api:latest-${{ matrix.arch }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # GHA cache backend can return HTML error pages; do not fail a successful push
+          cache-to: type=gha,mode=max,ignore-error=true
           provenance: mode=max
           sbom: true
 
@@ -93,60 +193,96 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign image with cosign
-        run: cosign sign --yes calciumion/new-api@${{ steps.build.outputs.digest }}
+        id: sign
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # After successful sign only: retag :latest from the signed digest (not mutable :TAG)
+      - name: Maybe update :latest (recheck main tip after build+sign)
+        id: latest
+        if: ${{ env.LATEST_CANDIDATE == 'true' }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          MAIN_SHA=$(git rev-parse origin/main)
+          if [ "$MAIN_SHA" != "$TAG_SHA" ]; then
+            echo "::warning::origin/main moved during build; skip :latest (kept version tag only)"
+            echo "PUSHED_LATEST=false" >> "$GITHUB_ENV"
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}@${IMAGE_DIGEST}"
+          echo "PUSHED_LATEST=true" >> "$GITHUB_ENV"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "Updated :latest → ${IMAGE}@${IMAGE_DIGEST}"
+
+      # Metadata-only GitHub Release (notes and pull command); /releases/latest follows
+      # the :latest image. Bare binaries remain optional via release.yml workflow_dispatch.
+      - name: Determine GitHub Release latest policy
+        id: release_policy
+        env:
+          RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.latest.outputs.pushed }}" = "true" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS=$(curl --silent --show-error \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${RELEASE_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}")
+          case "$STATUS" in
+            200) echo "make_latest=" >> "$GITHUB_OUTPUT" ;;
+            404) echo "make_latest=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::Unable to determine existing Release state (HTTP ${STATUS})"
+              exit 1
+              ;;
+          esac
+
+      # Promote only with Docker :latest; preserve existing Releases and keep new
+      # historical Releases from becoming latest.
+      - name: Create or update GitHub Release (metadata)
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          generate_release_notes: true
+          make_latest: ${{ steps.release_policy.outputs.make_latest }}
+          body: |
+            ## Container image
+
+            ```
+            docker pull ${{ env.IMAGE }}:${{ env.TAG }}
+            ```
+
+            Digest: `${{ steps.build.outputs.digest }}`
+
+            Default deploy path is GHCR (not bare `go` binaries). Optional Linux amd64 binaries: Actions → **Release (Linux amd64 binaries)** → Run workflow with this tag.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Image summary
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "calciumion/new-api:${TAG}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-  create_manifests:
-    name: Create multi-arch manifests
-    needs: [build_single_arch]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-
-    permissions:
-      id-token: write
-
-    steps:
-      - name: Set version
-        run: echo "TAG=${{ needs.build_single_arch.outputs.tag }}" >> $GITHUB_ENV
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create & push manifest (version)
-        run: |
-          docker buildx imagetools create \
-            -t calciumion/new-api:${TAG} \
-            calciumion/new-api:${TAG}-amd64 \
-            calciumion/new-api:${TAG}-arm64
-
-      - name: Create & push manifest (latest)
-        run: |
-          docker buildx imagetools create \
-            -t calciumion/new-api:latest \
-            calciumion/new-api:latest-amd64 \
-            calciumion/new-api:latest-arm64
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign manifests with cosign
-        run: |
-          cosign sign --yes calciumion/new-api:${TAG}
-          cosign sign --yes calciumion/new-api:latest
-
-      - name: Manifest summary
-        run: |
-          echo "### Multi-arch Manifest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect calciumion/new-api:${TAG} >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### GHCR image (amd64)"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "${{ steps.build.outputs.digest }}"
+            echo "base_upstream_tag=${BASE}"
+            echo "latest_candidate=${LATEST_CANDIDATE}"
+            echo "pushed_latest=${PUSHED_LATEST:-false}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

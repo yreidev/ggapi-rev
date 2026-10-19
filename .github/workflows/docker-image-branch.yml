@@ -1,12 +1,19 @@
 name: Publish Docker image (manual branch)
 
+# Manual branch → GHCR under branch-* tags only (test images before a release).
+# Never overwrites formal release tags (v*.N) or :latest.
+
 on:
   workflow_dispatch:
     inputs:
       branch:
-        description: "Branch name to build (e.g. alpha, nightly)"
+        description: "Branch name to build (must be refs/heads/*; e.g. main, alpha). Not a release tag."
         required: true
         type: string
+
+concurrency:
+  group: ghcr-branch-${{ inputs.branch }}
+  cancel-in-progress: true
 
 jobs:
   prepare:
@@ -15,8 +22,9 @@ jobs:
     outputs:
       branch: ${{ steps.version.outputs.branch }}
       sha: ${{ steps.version.outputs.sha }}
-      tag_prefix: ${{ steps.version.outputs.tag_prefix }}
+      image_tag: ${{ steps.version.outputs.image_tag }}
       version: ${{ steps.version.outputs.version }}
+      image: ${{ steps.version.outputs.image }}
     permissions:
       contents: read
     steps:
@@ -30,41 +38,76 @@ jobs:
         id: version
         env:
           BRANCH_NAME: ${{ inputs.branch }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          TAG_PREFIX=$(printf '%s' "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')
-          TAG_PREFIX=${TAG_PREFIX:0:105}
-          TAG_PREFIX=$(printf '%s' "$TAG_PREFIX" | sed -E 's/[.-]+$//')
-          if [ -z "$TAG_PREFIX" ]; then
-            echo "::error::Branch '$BRANCH_NAME' cannot be converted to a valid Docker tag prefix"
+          set -euo pipefail
+
+          # Normalize documented form refs/heads/<name>
+          case "$BRANCH_NAME" in
+            refs/heads/*) BRANCH_NAME="${BRANCH_NAME#refs/heads/}" ;;
+          esac
+
+          # Must be a real branch head only (reject tags, SHAs, other refs)
+          if git show-ref --verify --quiet "refs/tags/${BRANCH_NAME}"; then
+            echo "::error::Refusing tag name as branch input; use docker-build.yml for release tags"
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}" \
+            && ! git show-ref --verify --quiet "refs/remotes/origin/${BRANCH_NAME}"; then
+            echo "::error::Ref is not a branch head (refs/heads/* or origin/*)"
             exit 1
           fi
 
+          case "$BRANCH_NAME" in
+            latest|LATEST)
+              echo "::error::Refusing branch name latest (would collide with production alias)"
+              exit 1
+              ;;
+          esac
+          if printf '%s' "$BRANCH_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Refusing version-like branch name; use a non-v* branch"
+            exit 1
+          fi
+
+          SAFE=$(printf '%s' "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')
+          SAFE=${SAFE:0:60}
+          SAFE=$(printf '%s' "$SAFE" | sed -E 's/[.-]+$//')
+          if [ -z "$SAFE" ]; then
+            echo "::error::Branch cannot be converted to a valid Docker tag fragment"
+            exit 1
+          fi
+
+          # Hash original branch name so feature/foo vs feature-foo cannot collide
+          NAME_HASH=$(printf '%s' "$BRANCH_NAME" | sha256sum | cut -c1-8)
+
+          # Namespace: never collide with formal release tags or :latest
+          IMAGE_TAG="branch-${SAFE}-${NAME_HASH}"
           SHA=$(git rev-parse HEAD)
           SHORT_SHA=$(git rev-parse --short HEAD)
-          VERSION="${TAG_PREFIX}-$(date +'%Y%m%d')-${SHORT_SHA}"
+          VERSION="${IMAGE_TAG}-$(date +'%Y%m%d')-${SHORT_SHA}"
+          IMAGE="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+
+          case "$IMAGE" in
+            *calciumion/new-api*|docker.io/calciumion/*)
+              echo "::error::Refusing upstream Docker Hub image namespace: $IMAGE"
+              exit 1
+              ;;
+          esac
 
           echo "branch=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "tag_prefix=$TAG_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Prepared Docker tags for $BRANCH_NAME at $SHORT_SHA"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Prepared GHCR branch image ${IMAGE}:${IMAGE_TAG} / ${IMAGE}:${VERSION}"
 
-  build_single_arch:
-    name: Build & push (${{ matrix.arch }}) [native]
+  build_amd64:
+    name: Build & push (amd64)
     needs: [prepare]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
       id-token: write
     steps:
       - name: Check out branch
@@ -76,37 +119,38 @@ jobs:
       - name: Write VERSION
         run: |
           echo "${{ needs.prepare.outputs.version }}" > VERSION
-          echo "Publishing version: ${{ needs.prepare.outputs.version }} for ${{ matrix.arch }}"
+          echo "Publishing ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }} for amd64"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (labels)
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: |
-            calciumion/new-api
+          images: ${{ needs.prepare.outputs.image }}
 
-      - name: Build & push single-arch
+      - name: Build & push amd64
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64
           push: true
           tags: |
-            calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }}-${{ matrix.arch }}
-            calciumion/new-api:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.image_tag }}
+            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # GHA cache backend can return HTML error pages; do not fail a successful push
+          cache-to: type=gha,mode=max,ignore-error=true
           provenance: mode=max
           sbom: true
 
@@ -114,57 +158,15 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign image with cosign
-        run: cosign sign --yes calciumion/new-api@${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${{ needs.prepare.outputs.image }}@${{ steps.build.outputs.digest }}"
 
       - name: Output digest
         run: |
-          echo "### Docker Image Digest (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          echo "calciumion/new-api:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-  create_manifests:
-    name: Create multi-arch manifests (Docker Hub)
-    needs: [prepare, build_single_arch]
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - name: Log in to Docker Hub
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create & push manifest (Docker Hub - branch)
-        run: |
-          docker buildx imagetools create \
-            -t calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }} \
-            calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }}-amd64 \
-            calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }}-arm64
-
-      - name: Create & push manifest (Docker Hub - versioned)
-        run: |
-          docker buildx imagetools create \
-            -t calciumion/new-api:${{ needs.prepare.outputs.version }} \
-            calciumion/new-api:${{ needs.prepare.outputs.version }}-amd64 \
-            calciumion/new-api:${{ needs.prepare.outputs.version }}-arm64
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
-      - name: Sign manifests with cosign
-        run: |
-          cosign sign --yes calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }}
-          cosign sign --yes calciumion/new-api:${{ needs.prepare.outputs.version }}
-
-      - name: Output manifest digest
-        run: |
-          echo "### Multi-arch Manifest Digests" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect calciumion/new-api:${{ needs.prepare.outputs.tag_prefix }} >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          docker buildx imagetools inspect calciumion/new-api:${{ needs.prepare.outputs.version }} >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### GHCR image (amd64, branch-*)"
+            echo '```'
+            echo "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.image_tag }}"
+            echo "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}"
+            echo "${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
