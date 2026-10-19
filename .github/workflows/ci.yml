@@ -3,6 +3,9 @@ name: CI
 on:
   pull_request:
     types: [opened, synchronize, closed]
+  # Changes land by pushing main directly, without pull requests.
+  push:
+    branches: [main]
 
 permissions:
   contents: read

@@ -4,3 +4,5 @@ updates:
     directory: "/web"
     schedule:
       interval: "weekly"
+    # Dependencies follow upstream syncs; 0 turns off version update pull requests.
+    open-pull-requests-limit: 0

@@ -6,6 +6,25 @@ DO NOT send optional commentary
 
 This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI providers (OpenAI, Claude, Gemini, Azure, AWS Bedrock, etc.) behind a unified API, with user management, billing, rate limiting, and an admin dashboard.
 
+## 本仓库的维护方式
+
+本仓库在上游 new-api 之上长期维护少量改动，原则是相对上游做最小改动。
+
+| 远程 | 仓库 | 用途 |
+|------|------|------|
+| `origin` | yreidev/ggapi-rev | 只向这里推送 |
+| `upstream` | QuantumNous/new-api | 只 fetch，不推送 |
+
+- **改动方式：** 优先用配置和独立的扩展点，少改上游热点文件（计费、鉴权、relay、model 里的事务和锁）。相对上游的全部改动用 `git log --no-merges upstream/main..main` 查看。
+- **合入：** 在功能分支上提交，维护者同意后在本地 `git merge --no-ff` 进 `main`，再 `git push origin main`。不开 PR，不强推，推送后等 `main` 的 CI。下文 Issues、Pull requests 两条只适用于向上游提交，由维护者本人操作。
+- **同步上游：** 从最新的 `main` 开 `sync/upstream-<日期>` 分支，`git merge upstream/main`（不 rebase `main`），分支里不夹带功能改动；验证后同样 `--no-ff` 合入 `main`。
+- **发版：** tag 格式是 `<上游 tag>.N`，例如 `v1.0.0-rc.45.1`。上游 tag 取 `main` 已包含的最新上游 tag（`git describe --tags --abbrev=0 "$(git merge-base main upstream/main)"`）；N 是同一个上游 tag 上的第几次发版，上游 tag 变了就从 1 重新数。tag 只打在已推送的 `origin/main` 最新提交上，只推这一个 tag（`git push origin <tag>`），不要 `--tags`。
+  - 推 tag 后 `docker-build.yml` 构建 linux/amd64 镜像，推到 `ghcr.io/<owner>/<repo>:<tag>` 并用 cosign 签名，同时建 GitHub Release。构建和签名完成时 tag 仍是 `main` 最新提交，才更新 `:latest` 和 Release 的 latest；手动重跑只重建版本号标签，不动 `:latest`。
+  - 发版前要先测某个分支：手动运行 `docker-image-branch.yml`，镜像标签是 `branch-*`。
+  - Linux amd64 二进制只在手动运行 `release.yml` 时构建；Electron 只手动打包；不推上游的 Docker Hub 镜像。依赖升级跟着上游同步走，Dependabot 不开版本更新 PR。
+
+以下工程规则对本仓库和向上游贡献同样适用。
+
 ## Tech Stack
 
 - **Backend**: Go 1.26 for the root module and `tokenkit/`, Go 1.25.1 for `relaykit/` (see each module’s `go.mod`), Gin web framework, GORM v2 ORM
