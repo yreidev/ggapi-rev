@@ -6,6 +6,8 @@ on:
   # Changes land by pushing main directly, without pull requests.
   push:
     branches: [main]
+  # Re-run on demand, e.g. when a push did not create a push event.
+  workflow_dispatch:
 
 permissions:
   contents: read
