@@ -1,8 +1,7 @@
 name: Publish Docker image (Linux amd64)
 
 # Release tag → GHCR image ghcr.io/<owner>/<repo>, plus a GitHub Release with notes.
-# Never pushes to the upstream Docker Hub image. Bare binaries are optional via
-# release.yml dispatch only.
+# Never pushes to the upstream Docker Hub image; no bare binaries are published.
 #
 # Tag rules (see the release section in AGENTS.md):
 # - Form: <existing-upstream-tag>.N  e.g. v1.0.0-rc.45.1
@@ -23,7 +22,8 @@ on:
         required: true
         type: string
 
-# Serialize GHCR metadata and optional binary Release writes across workflows.
+# Serialize tag pushes and manual rebuilds of the same tag, so Release state cannot
+# change between policy detection and the final write.
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
@@ -224,7 +224,7 @@ jobs:
           echo "Updated :latest → ${IMAGE}@${IMAGE_DIGEST}"
 
       # Metadata-only GitHub Release (notes and pull command); /releases/latest follows
-      # the :latest image. Bare binaries remain optional via release.yml workflow_dispatch.
+      # the :latest image.
       - name: Determine GitHub Release latest policy
         id: release_policy
         env:
@@ -269,8 +269,6 @@ jobs:
             ```
 
             Digest: `${{ steps.build.outputs.digest }}`
-
-            Default deploy path is GHCR (not bare `go` binaries). Optional Linux amd64 binaries: Actions → **Release (Linux amd64 binaries)** → Run workflow with this tag.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
