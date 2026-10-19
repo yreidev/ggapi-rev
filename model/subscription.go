@@ -220,9 +220,12 @@ type SubscriptionOrder struct {
 	TradeNo         string `json:"trade_no" gorm:"unique;type:varchar(255);index"`
 	PaymentMethod   string `json:"payment_method" gorm:"type:varchar(50)"`
 	PaymentProvider string `json:"payment_provider" gorm:"type:varchar(50);default:''"`
-	Status          string `json:"status"`
-	CreateTime      int64  `json:"create_time"`
-	CompleteTime    int64  `json:"complete_time"`
+	// AffInviterId is the invitee's inviter at order creation time. Settlement
+	// uses this snapshot so later rebinds only affect subsequent orders.
+	AffInviterId int    `json:"aff_inviter_id" gorm:"type:int;default:0;column:aff_inviter_id;index"`
+	Status       string `json:"status"`
+	CreateTime   int64  `json:"create_time"`
+	CompleteTime int64  `json:"complete_time"`
 
 	ProviderPayload string `json:"provider_payload" gorm:"type:text"`
 }
@@ -231,7 +234,10 @@ func (o *SubscriptionOrder) Insert() error {
 	if o.CreateTime == 0 {
 		o.CreateTime = common.GetTimestamp()
 	}
-	return DB.Create(o).Error
+	return DB.Transaction(func(tx *gorm.DB) error {
+		o.AffInviterId = resolveAffiliateInviterIdTx(tx, o.UserId)
+		return tx.Create(o).Error
+	})
 }
 
 func (o *SubscriptionOrder) Update() error {
@@ -599,6 +605,29 @@ func CompleteSubscriptionOrder(tradeNo string, providerPayload string, expectedP
 		}
 		if !plan.Enabled {
 			// still allow completion for already purchased orders
+		}
+		// Settle the inviter commission before the invitee row lock
+		// below so both user rows are locked in ascending id order. Only convert
+		// money to quota when commission is possible, so a large price never
+		// blocks fulfilling an already-paid order.
+		if order.AffInviterId > 0 && order.Money > 0 && common.QuotaPerUnit > 0 {
+			commissionBaseQuota, err := common.WalletQuotaFromDecimalStrict(
+				decimal.NewFromFloat(order.Money).Mul(decimal.NewFromFloat(common.QuotaPerUnit)),
+			)
+			if err != nil {
+				common.SysError(common.LogText("skip subscription affiliate commission trade_no=%s: %s", order.TradeNo, err.Error()))
+			} else if _, _, err := SettleAffiliateCommissionTx(
+				tx,
+				order.UserId,
+				AffiliateCommissionSourceSubscription,
+				order.Id,
+				order.TradeNo,
+				order.PaymentProvider,
+				commissionBaseQuota,
+				order.AffInviterId,
+			); err != nil {
+				return err
+			}
 		}
 		// 锁定用户行：并发完成同一用户的不同订单（包括多实例部署下）时，
 		// 使 CreateUserSubscriptionFromPlanTx 的 MaxPurchasePerUser 检查按用户串行。

@@ -20,9 +20,12 @@ type TopUp struct {
 	TradeNo         string  `json:"trade_no" gorm:"unique;type:varchar(255);index"`
 	PaymentMethod   string  `json:"payment_method" gorm:"type:varchar(50)"`
 	PaymentProvider string  `json:"payment_provider" gorm:"type:varchar(50);default:''"`
-	CreateTime      int64   `json:"create_time"`
-	CompleteTime    int64   `json:"complete_time"`
-	Status          string  `json:"status"`
+	// AffInviterId is the invitee's inviter at order creation time. Settlement
+	// uses this snapshot so later rebinds only affect subsequent orders.
+	AffInviterId int    `json:"aff_inviter_id" gorm:"type:int;default:0;column:aff_inviter_id;index"`
+	CreateTime   int64  `json:"create_time"`
+	CompleteTime int64  `json:"complete_time"`
+	Status       string `json:"status"`
 }
 
 const (
@@ -53,8 +56,29 @@ var (
 )
 
 func (topUp *TopUp) Insert() error {
-	var err error
-	err = DB.Create(topUp).Error
+	if topUp == nil {
+		return errors.New("topup is nil")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		topUp.AffInviterId = resolveAffiliateInviterIdTx(tx, topUp.UserId)
+		return tx.Create(topUp).Error
+	})
+}
+
+// settleTopUpAffiliateCommissionTx settles the inviter commission inside the
+// top-up completion transaction. Callers run it before the
+// wallet credit so the invitee and inviter rows are locked in ascending id order.
+func settleTopUpAffiliateCommissionTx(tx *gorm.DB, topUp *TopUp, creditedQuota int) error {
+	_, _, err := SettleAffiliateCommissionTx(
+		tx,
+		topUp.UserId,
+		AffiliateCommissionSourceTopUp,
+		topUp.Id,
+		topUp.TradeNo,
+		topUp.PaymentProvider,
+		creditedQuota,
+		topUp.AffInviterId,
+	)
 	return err
 }
 
@@ -215,6 +239,9 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 		if err := tx.Save(topUp).Error; err != nil {
 			return err
 		}
+		if err := settleTopUpAffiliateCommissionTx(tx, topUp, quotaToAdd); err != nil {
+			return err
+		}
 		return creditTopUpQuota(tx, topUp.UserId, quotaToAdd, nil)
 	})
 	if err != nil {
@@ -272,6 +299,9 @@ func Recharge(referenceId string, customerId string, callerIp string) (err error
 		)
 		if err != nil || quota <= 0 {
 			return ErrInvalidTopUpQuota
+		}
+		if err := settleTopUpAffiliateCommissionTx(tx, topUp, quota); err != nil {
+			return err
 		}
 		return creditTopUpQuota(tx, topUp.UserId, quota, map[string]any{
 			"stripe_customer": customerId,
@@ -503,6 +533,9 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 		}
 
 		// 增加用户额度（立即写库，保持一致性）
+		if err := settleTopUpAffiliateCommissionTx(tx, topUp, quotaToAdd); err != nil {
+			return err
+		}
 		if err := creditTopUpQuota(tx, topUp.UserId, quotaToAdd, nil); err != nil {
 			return err
 		}
@@ -580,6 +613,9 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 			}
 		}
 
+		if err := settleTopUpAffiliateCommissionTx(tx, topUp, quota); err != nil {
+			return err
+		}
 		return creditTopUpQuota(tx, topUp.UserId, quota, updateFields)
 	})
 
@@ -638,6 +674,9 @@ func RechargeWaffo(tradeNo string, callerIp string) (err error) {
 			return err
 		}
 
+		if err := settleTopUpAffiliateCommissionTx(tx, topUp, quotaToAdd); err != nil {
+			return err
+		}
 		return creditTopUpQuota(tx, topUp.UserId, quotaToAdd, nil)
 	})
 
@@ -698,6 +737,9 @@ func RechargeWaffoPancake(tradeNo string) (err error) {
 			return err
 		}
 
+		if err := settleTopUpAffiliateCommissionTx(tx, topUp, quotaToAdd); err != nil {
+			return err
+		}
 		return creditTopUpQuota(tx, topUp.UserId, quotaToAdd, nil)
 	})
 

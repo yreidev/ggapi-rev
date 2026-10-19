@@ -122,6 +122,15 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/user/2fa/stats":                          accessTokenScopeRule("user:read"),
 	"DELETE /api/user/:id/2fa":                         accessTokenScopeRule("user:write"),
 
+	// router/api-router.go: /api/affiliate
+	"GET /api/affiliate/self":             accessTokenScopeRule("wallet:read"),
+	"POST /api/affiliate/self/bind":       accessTokenScopeRule("wallet:write"),
+	"GET /api/affiliate/self/commissions": accessTokenScopeRule("wallet:read"),
+	"GET /api/affiliate/commissions":      accessTokenScopeRule("billing:read"),
+	"GET /api/affiliate/users/search":     accessTokenScopeRule("user:read"),
+	"GET /api/affiliate/users/:id":        accessTokenScopeRule("user:read"),
+	"PUT /api/affiliate/users/:id":        accessTokenScopeRule("user:write"),
+
 	// router/api-router.go: /api/subscription
 	"GET /api/subscription/plans":                                    accessTokenScopeRule("wallet:read"),
 	"GET /api/subscription/self":                                     accessTokenScopeRule("wallet:read"),
